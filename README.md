@@ -85,3 +85,25 @@ restart never touches GitHub.
 ## License
 
 Apache 2.0. See `LICENSE`.
+
+## Observed weakness in V1: what failed and why
+There are 20 images in v3 and v6. These two variants produced 9 rejections and 1 wrong match. All 20 images from these two variants had a score of 0 from 
+Rule 3. Some examples:
+-original_00__crop_keep60__resized__q45__v6.jpg
+-original_08__crop_keep60__resized__q45__v6.jpg
+-original_00__resize_scale114__compress__q45__v3.jpg
+This is because Rule 3 lines things up at one scale, and both v3 and v6 involve resizing. Positions don't line up between the suspect and the original. 
+The scale is not preserved so Rule 3 gives a score of 0. 
+## Design decision for V2: what Rule 4 is and why you chose it
+Rule 4 is about normalizing the same long side so a pure resize lines up. It starts by loading a small grayscale of each image. Then we find the biggest
+scale that fits so that the template/suspect is no bigger than the original it slides over. The suspect is tried at many sizes. We slide and score, with
+normalized cross correlation ignoring brightness and contrast. The best result across all sizes is stored. NCC gets rescaled into a good metric and the 
+rule fires accordingly. This was chosen because cv2.matchTemplate in rule 3 only works if the suspect and the original are at the same pixel scale. So we
+try many sizes to find the right scale. 
+## Effect of the change: accuracy before/after on easy vs hard
+On Easy, the rules identified the 60 matches using V1 and only 52 matches using V2, so a slight decrease in accuracy. 
+On Hard, the rules identified 50 correct matches using V1 and 52 correct matches using V2, so a marginal increase. 
+## Trade-offs: what new costs or risks did Rule 4 introduce
+After Rule 4 was introduced, v6 was 10/10 correct, which was giving problems before. resize_scale114 was also fixed, and wrong matches were down from 0 to 1.
+However, results got worse with crop_25pct and crop_50pct. With crop_50pct, one image was now rejected after Rule 4, and crop_25pct went from 10/10 correct to 
+3/10 correct. These were carried by Rule 3 in V1 but it's weight was reduced in V2 and Rule 4 scores 0 on most of these. 
