@@ -33,6 +33,14 @@ from PIL import Image
 #: Rule names used by SimpleDetector.evaluate() (V1).
 RULES = ("rule1_metadata", "rule2_histogram", "rule3_template")
 
+# Knobs to be able to tune as constants
+R1_FIRE = 0.5          # rule 1 fires at/above this metric
+R2_FLOOR = 0.65        # histogram correlation at/below this = no evidence
+R2_FIRE = 0.2          # rule 2 fires at/above this (rescaled) metric
+R3_FLOOR = 0.5         # template match at/below this = no evidence
+R3_FIRE = 0.1          # rule 3 fires at/above this (rescaled) metric
+MIN_INLIERS = 15       # feature matches needed to trust an ORB match
+
 
 @lru_cache(maxsize=256)
 def _arr(path):
@@ -75,22 +83,67 @@ def _size(path):
     except Exception:
         return None
 
+# function to Examine first 16 bytes to determine file type
+def _magic(filepath):
+  with open(filepath, 'rb') as f:
+      header_bytes = f.read(16)
+  if header_bytes.startswith(b'\x89PNG'):
+      return "png"
+  if header_bytes.startswith(b'\xFF\xD8'):
+      return "jpeg"
+  return "other"
+
+#Full resolution grayscale used by rule 3 so both images share a scale
+@lru_cache(maxsize=256)
+def _gray_full(path):
+    img = _arr(path)
+    if img is None:
+        return None
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+#Oriented FAST and Rotated BRIEF keypoints to handle rotation + scale. Cached like rest
+@lru_cache(maxsize=256)
+def _orb(path):
+  g = _gray(path) #load as grayscale
+  if g is None:
+    return None
+  #create detector and keep 1500 strongest keypoints
+  #kp = list of keypoints
+  #des = Numpy array with one fingerprint per row
+  kp, des = cv2.ORB_create(nfeatures=1500).detectAndCompute(g, None)
+  #discard images with no features
+  if des is None or len(kp) < 10:
+    return None
+  #return each keypoint (x,y) position as an array and the fingerprints
+  return np.float32([k.pt for k in kp]), des
 
 def rule1_metadata(target, input_path):
-    """File size + dimensions. Compression and crops leave size fingerprints."""
+    """changed to be header + dimensions instead of raw file-size ratio."""
     out = {"rule": 1, "name": "Metadata", "fired": False, "score": 0,
            "out_of": 30, "note": "Size ratio 0.00", "metric": 0.0}
     try:
-        src_size = os.path.getsize(target["path"])
-        in_size = os.path.getsize(input_path)
-        src_w, src_h = _size(target["path"]) or (0, 0)
-        in_w, in_h = _size(input_path) or (0, 0)
-        size_ratio = min(src_size, in_size) / max(src_size, in_size)
-        area_kept = (in_w * in_h) / max(1, src_w * src_h)
-        metric = 0.5 * size_ratio + 0.5 * min(1.0, area_kept)
+        sw, sh = _size(target["path"]) or (0, 0)
+        iw, ih = _size(input_path) or (0, 0)
+
+        if (iw, ih) == (sw, sh):
+            # same dimensions
+            if _magic(target["path"]) != _magic(input_path):
+                metric = 1.0 # JPEG / PNG format change
+            else:
+              a = os.path.getsize(target["path"])
+              b = os.path.getsize(input_path)
+              metric = 0.7 + 0.3 * min(a, b) / max(a, b) #recompression
+        elif (iw, ih) == (sh, sw):
+          metric = 0.8 #rotated 90 degrees
+        elif sw and sh and ih and abs((iw/ih) / (sw / sh) -1 ) < 0.02:
+          metric = 0.85 #same aspect ratio -> resized, with 2% tolerance
+        elif iw <= sw and ih <= sh and sw * sh > 0:
+          metric = 0.4 + 0.4 * (iw * ih) / (sw * sh) #crop
+        else:
+          metric = 0.2
         out["metric"] = round(max(0.0, min(1.0, metric)), 3)
         out["note"] = f"Size ratio {out['metric']:.2f}"
-        if out["metric"] >= 0.6:
+        if out["metric"] >= R1_FIRE:
             out["fired"] = True
             out["score"] = int(round(out["out_of"] * out["metric"]))
     except Exception:
@@ -99,7 +152,9 @@ def rule1_metadata(target, input_path):
 
 
 def rule2_histogram(target, input_path):
-    """Color histogram correlation. Robust to crops and spatial changes."""
+    """Color histogram correlation. Robust to crops and spatial changes.
+    Changed scoring. Unrelated images correlate ~0.5-0.8, so
+    rescale [R2_FLOOR, 1] -> [0, 1] instead of using the raw correlation."""
     out = {"rule": 2, "name": "Histogram", "fired": False, "score": 0,
            "out_of": 30, "note": "Correlation 0.00", "metric": 0.0}
     try:
@@ -107,9 +162,11 @@ def rule2_histogram(target, input_path):
         if hs is None or hi is None:
             return out
         corr = float(cv2.compareHist(hs, hi, cv2.HISTCMP_CORREL))
-        out["metric"] = round(max(0.0, min(1.0, corr)), 3)
-        out["note"] = f"Correlation {out['metric']:.2f}"
-        if out["metric"] >= 0.5:
+        raw = max(0.0, min(1.0, corr))
+        metric = max(0.0, (raw - R2_FLOOR) / (1.0 - R2_FLOOR))
+        out["metric"] = round(min(1.0, metric), 3)
+        out["note"] = f"Correlation {raw:.2f}"
+        if out["metric"] >= R2_FIRE:
             out["fired"] = True
             out["score"] = int(round(out["out_of"] * out["metric"]))
     except Exception:
@@ -123,22 +180,35 @@ def rule3_template(target, input_path):
     cv2.matchTemplate needs the template (suspect) smaller than the target
     (original); on rotated/resized suspects this rule degrades fast. Fixing
     that becomes Rule 4 territory.
+
+    Change: both images shrunk by same factor instead of independently. score also
+    rescaled so weak matches count as 0. 
     """
     out = {"rule": 3, "name": "Template", "fired": False, "score": 0,
            "out_of": 40, "note": "Match score 0.00", "metric": 0.0}
     try:
-        src_g = _gray(target["path"])
-        nd_g = _gray(input_path)
-        if src_g is None or nd_g is None:
+        src = _gray_full(target["path"])
+        nd = _gray_full(input_path)
+        if src is None or nd is None:
             return out
-        if (src_g.shape[0] < nd_g.shape[0]) or (src_g.shape[1] < nd_g.shape[1]):
-            nd_g = cv2.resize(nd_g, (min(nd_g.shape[1], src_g.shape[1]),
-                                     min(nd_g.shape[0], src_g.shape[0])))
-        res = cv2.matchTemplate(src_g, nd_g, cv2.TM_CCOEFF_NORMED)
-        metric = float(res.max())
-        out["metric"] = round(max(0.0, min(1.0, metric)), 3)
+
+        #One shared scale taken from original 
+        s = min(1.0, 512 / max(src.shape))
+        if s < 1.0:
+            src = cv2.resize(src, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+            nd = cv2.resize(nd, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+
+        # template must fit inside the original: shrink uniformly if it doesn't
+        fit = min(src.shape[1] / nd.shape[1], src.shape[0] / nd.shape[0])
+        if fit < 1.0:
+            nd = cv2.resize(nd, None, fx=fit, fy=fit, interpolation=cv2.INTER_AREA)
+
+        res = cv2.matchTemplate(src, nd, cv2.TM_CCOEFF_NORMED)
+        best = float(np.nan_to_num(res.max()))
+        metric = max(0.0, (best - R3_FLOOR) / (1.0 - R3_FLOOR))
+        out["metric"] = round(min(1.0, metric), 3)
         out["note"] = f"Match score {out['metric']:.2f}"
-        if out["metric"] >= 0.4:
+        if out["metric"] >= R3_FIRE:
             out["fired"] = True
             out["score"] = int(round(out["out_of"] * out["metric"]))
     except Exception:
